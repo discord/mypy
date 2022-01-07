@@ -116,7 +116,7 @@ from mypy.semanal_shared import (
 )
 from mypy.semanal_namedtuple import NamedTupleAnalyzer
 from mypy.semanal_typeddict import TypedDictAnalyzer
-from mypy.semanal_enum import EnumCallAnalyzer
+from mypy.semanal_enum import EnumCallAnalyzer, ENUM_BASES
 from mypy.semanal_newtype import NewTypeAnalyzer
 from mypy.reachability import (
     infer_reachability_of_if_statement, infer_condition_value, ALWAYS_FALSE, ALWAYS_TRUE,
@@ -1552,18 +1552,12 @@ class SemanticAnalyzer(NodeVisitor[None],
             elif isinstance(base, Instance):
                 if base.type.is_newtype:
                     self.fail('Cannot subclass "NewType"', defn)
-                if (
-                    base.type.is_enum
-                    and base.type.fullname not in (
-                        'enum.Enum', 'enum.IntEnum', 'enum.Flag', 'enum.IntFlag')
-                    and base.type.names
-                    and any(not isinstance(n.node, (FuncBase, Decorator))
-                            for n in base.type.names.values())
-                ):
+                if self.enum_has_final_values(base):
                     # This means that are trying to subclass a non-default
                     # Enum class, with defined members. This is not possible.
                     # In runtime, it will raise. We need to mark this type as final.
                     # However, methods can be defined on a type: only values can't.
+                    # We also don't count values with annotations only.
                     base.type.is_final = True
                 base_types.append(base)
             elif isinstance(base, AnyType):
@@ -1601,6 +1595,25 @@ class SemanticAnalyzer(NodeVisitor[None],
             self.set_dummy_mro(defn.info)
             return
         self.calculate_class_mro(defn, self.object_type)
+
+    def enum_has_final_values(self, base: Instance) -> bool:
+        if (
+            base.type.is_enum
+            and base.type.fullname not in ENUM_BASES
+            and base.type.names
+            and base.type.defn
+        ):
+            for sym in base.type.names.values():
+                if isinstance(sym.node, (FuncBase, Decorator)):
+                    continue  # A method
+                if not isinstance(sym.node, Var):
+                    return True  # Can be a class
+                if self.is_stub_file or sym.node.has_explicit_value:
+                    # Corner case: assignments like `x: int` are fine in `.py` files.
+                    # But, not is `.pyi` files, because we don't know
+                    # if there's aactually a value or not.
+                    return True
+        return False
 
     def configure_tuple_base_class(self,
                                    defn: ClassDef,
@@ -2041,7 +2054,7 @@ class SemanticAnalyzer(NodeVisitor[None],
 
     def visit_assignment_expr(self, s: AssignmentExpr) -> None:
         s.value.accept(self)
-        self.analyze_lvalue(s.target, escape_comprehensions=True)
+        self.analyze_lvalue(s.target, escape_comprehensions=True, has_explicit_value=True)
 
     def visit_assignment_stmt(self, s: AssignmentStmt) -> None:
         self.statement = s
@@ -2232,6 +2245,12 @@ class SemanticAnalyzer(NodeVisitor[None],
                 return True
             # Assignment color = Color['RED'] defines a variable, not an alias.
             return not rv.node.is_enum
+        if isinstance(rv.node, Var):
+            return rv.node.fullname in (
+                'typing.NoReturn',
+                'typing_extensions.NoReturn',
+                'mypy_extensions.NoReturn',
+            )
 
         if isinstance(rv, NameExpr):
             n = self.lookup(rv.name, rv)
@@ -2334,10 +2353,20 @@ class SemanticAnalyzer(NodeVisitor[None],
             assert isinstance(s.unanalyzed_type, UnboundType)
             if not s.unanalyzed_type.args:
                 explicit = False
+
+        if s.rvalue:
+            if isinstance(s.rvalue, TempNode):
+                has_explicit_value = not s.rvalue.no_rhs
+            else:
+                has_explicit_value = True
+        else:
+            has_explicit_value = False
+
         for lval in s.lvalues:
             self.analyze_lvalue(lval,
                                 explicit_type=explicit,
-                                is_final=s.is_final_def)
+                                is_final=s.is_final_def,
+                                has_explicit_value=has_explicit_value)
 
     def apply_dynamic_class_hook(self, s: AssignmentStmt) -> None:
         if not isinstance(s.rvalue, CallExpr):
@@ -2606,7 +2635,6 @@ class SemanticAnalyzer(NodeVisitor[None],
                                  self.plugin,
                                  self.options,
                                  self.is_typeshed_stub_file,
-                                 allow_new_syntax=self.is_stub_file,
                                  allow_placeholder=allow_placeholder,
                                  in_dynamic_func=dynamic,
                                  global_scope=global_scope)
@@ -2777,7 +2805,8 @@ class SemanticAnalyzer(NodeVisitor[None],
                        nested: bool = False,
                        explicit_type: bool = False,
                        is_final: bool = False,
-                       escape_comprehensions: bool = False) -> None:
+                       escape_comprehensions: bool = False,
+                       has_explicit_value: bool = False) -> None:
         """Analyze an lvalue or assignment target.
 
         Args:
@@ -2791,7 +2820,11 @@ class SemanticAnalyzer(NodeVisitor[None],
         if escape_comprehensions:
             assert isinstance(lval, NameExpr), "assignment expression target must be NameExpr"
         if isinstance(lval, NameExpr):
-            self.analyze_name_lvalue(lval, explicit_type, is_final, escape_comprehensions)
+            self.analyze_name_lvalue(
+                lval, explicit_type, is_final,
+                escape_comprehensions,
+                has_explicit_value=has_explicit_value,
+            )
         elif isinstance(lval, MemberExpr):
             self.analyze_member_lvalue(lval, explicit_type, is_final)
             if explicit_type and not self.is_self_member_ref(lval):
@@ -2815,7 +2848,8 @@ class SemanticAnalyzer(NodeVisitor[None],
                             lvalue: NameExpr,
                             explicit_type: bool,
                             is_final: bool,
-                            escape_comprehensions: bool) -> None:
+                            escape_comprehensions: bool,
+                            has_explicit_value: bool) -> None:
         """Analyze an lvalue that targets a name expression.
 
         Arguments are similar to "analyze_lvalue".
@@ -2845,7 +2879,7 @@ class SemanticAnalyzer(NodeVisitor[None],
 
         if (not existing or isinstance(existing.node, PlaceholderNode)) and not outer:
             # Define new variable.
-            var = self.make_name_lvalue_var(lvalue, kind, not explicit_type)
+            var = self.make_name_lvalue_var(lvalue, kind, not explicit_type, has_explicit_value)
             added = self.add_symbol(name, var, lvalue, escape_comprehensions=escape_comprehensions)
             # Only bind expression if we successfully added name to symbol table.
             if added:
@@ -2896,7 +2930,9 @@ class SemanticAnalyzer(NodeVisitor[None],
             existing = self.globals.get(orig_name)
             return existing is not None and is_final_node(existing.node)
 
-    def make_name_lvalue_var(self, lvalue: NameExpr, kind: int, inferred: bool) -> Var:
+    def make_name_lvalue_var(
+        self, lvalue: NameExpr, kind: int, inferred: bool, has_explicit_value: bool,
+    ) -> Var:
         """Return a Var node for an lvalue that is a name expression."""
         v = Var(lvalue.name)
         v.set_line(lvalue)
@@ -2911,6 +2947,7 @@ class SemanticAnalyzer(NodeVisitor[None],
             # fullanme should never stay None
             v._fullname = lvalue.name
         v.is_ready = False  # Type not inferred yet
+        v.has_explicit_value = has_explicit_value
         return v
 
     def make_name_lvalue_point_to_existing_def(
@@ -2954,7 +2991,14 @@ class SemanticAnalyzer(NodeVisitor[None],
             if len(star_exprs) == 1:
                 star_exprs[0].valid = True
             for i in items:
-                self.analyze_lvalue(i, nested=True, explicit_type=explicit_type)
+                self.analyze_lvalue(
+                    lval=i,
+                    nested=True,
+                    explicit_type=explicit_type,
+                    # Lists and tuples always have explicit values defined:
+                    # `a, b, c = value`
+                    has_explicit_value=True,
+                )
 
     def analyze_member_lvalue(self, lval: MemberExpr, explicit_type: bool, is_final: bool) -> None:
         """Analyze lvalue that is a member expression.
@@ -4045,6 +4089,7 @@ class SemanticAnalyzer(NodeVisitor[None],
                 name = target.type.fullname
                 if (alias.no_args and  # this avoids bogus errors for already reported aliases
                         name in get_nongen_builtins(self.options.python_version) and
+                        not self.is_stub_file and
                         not alias.normalized):
                     self.fail(no_subscript_builtin_alias(name, propose_alt=False), expr)
         # ...or directly.
@@ -4520,6 +4565,10 @@ class SemanticAnalyzer(NodeVisitor[None],
             return Instance(node, args)
         return Instance(node, [AnyType(TypeOfAny.unannotated)] * len(node.defn.type_vars))
 
+    def builtin_type(self, fully_qualified_name: str) -> Instance:
+        """Legacy function -- use named_type() instead."""
+        return self.named_type(fully_qualified_name)
+
     def lookup_current_scope(self, name: str) -> Optional[SymbolTableNode]:
         if self.locals[-1] is not None:
             return self.locals[-1].get(name)
@@ -4612,7 +4661,11 @@ class SemanticAnalyzer(NodeVisitor[None],
         names = self.current_symbol_table(escape_comprehensions=escape_comprehensions)
         existing = names.get(name)
         if isinstance(symbol.node, PlaceholderNode) and can_defer:
-            self.defer(context)
+            if context is not None:
+                self.process_placeholder(name, 'name', context)
+            else:
+                # see note in docstring describing None contexts
+                self.defer()
         if (existing is not None
                 and context is not None
                 and not is_valid_replacement(existing, symbol)):
@@ -5140,8 +5193,7 @@ class SemanticAnalyzer(NodeVisitor[None],
                             allow_tuple_literal=allow_tuple_literal,
                             report_invalid_types=report_invalid_types,
                             allow_placeholder=allow_placeholder,
-                            allow_required=allow_required,
-                            allow_new_syntax=self.is_stub_file)
+                            allow_required=allow_required)
         tpan.in_dynamic_func = bool(self.function_stack and self.function_stack[-1].is_dynamic())
         tpan.global_scope = not self.type and not self.function_stack
         return tpan

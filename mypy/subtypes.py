@@ -125,7 +125,10 @@ def _is_subtype(left: Type, right: Type,
         # of a union of all enum items as literal types. Only do it if
         # the previous check didn't succeed, since recombining can be
         # expensive.
-        if not is_subtype_of_item and isinstance(left, Instance) and left.type.is_enum:
+        # `bool` is a special case, because `bool` is `Literal[True, False]`.
+        if (not is_subtype_of_item
+                and isinstance(left, Instance)
+                and (left.type.is_enum or left.type.fullname == 'builtins.bool')):
             right = UnionType(mypy.typeops.try_contracting_literals_in_union(right.items))
             is_subtype_of_item = any(is_subtype(orig_left, item,
                                                 ignore_type_params=ignore_type_params,
@@ -1168,6 +1171,7 @@ def restrict_subtype_away(t: Type, s: Type, *, ignore_promotions: bool = False) 
 def covers_at_runtime(item: Type, supertype: Type, ignore_promotions: bool) -> bool:
     """Will isinstance(item, supertype) always return True at runtime?"""
     item = get_proper_type(item)
+    supertype = get_proper_type(supertype)
 
     # Since runtime type checks will ignore type arguments, erase the types.
     supertype = erase_type(supertype)
